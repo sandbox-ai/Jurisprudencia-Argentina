@@ -18,35 +18,43 @@ def get_urls(base_url, offset):
         return None
 
 def main():
-    base_url = "http://www.saij.gob.ar/busqueda?o=0&p=1000&f=Total%7CFecha%7CTema%5B5%2C1%5D%7COrganismo%5B5%2C1%5D%7CAutor%5B5%2C1%5D%7CJurisdicci%C3%B3n%5B5%2C1%5D%7CTribunal%2FCORTE+SUPREMA+DE+JUSTICIA+DE+LA+NACION%7CPublicaci%C3%B3n%5B5%2C1%5D%7CColecci%C3%B3n+tem%C3%A1tica%5B5%2C1%5D%7CTipo+de+Documento%2FJurisprudencia&s=fecha-rango%7CDESC&v=colapsada"
+    base_url = "http://www.saij.gob.ar/busqueda?o=0&p=1000&f=Total|Fecha/{}[20,1]|Estado de Vigencia[5,1]|Tema[5,1]|Organismo[5,1]|Autor[5,1]|Jurisdicción|Tribunal[5,1]|Publicación[5,1]|Colección temática[5,1]|Tipo de Documento/Jurisprudencia&s=fecha-rango|DESC&v=colapsada"
     offset = 0
+    year=2024
     all_urls = []
 
-    while True:
-        urls = get_urls(base_url, offset)
-        if not urls:
-            break
-        all_urls.extend(urls)
-        print(f"{len(urls)} URLs from offset {offset}")
-        offset += 1000
-        time.sleep(1)  # Be respectful to the server
+    while year >= 1800:
+        offset = 0  # reset offset for each year
+        while True:
+            urls = get_urls(base_url.format(year), offset)
+            if not urls:
+                break
+            all_urls.extend(urls)
+            print(f"{len(urls)} URLs from offset {offset}")
+            offset += 1000
+            time.sleep(1)  # Be respectful to the server
+        print(f"Collected {len(all_urls)} URLs for year {year}")
+        year -= 1  # move to the previous year
 
-    print(f"URLs para STJ: {len(all_urls)}")
-    
+
+    print(f"URLs: {len(all_urls)}")
+
+    with open('urls.txt', 'a') as f:
+        for url in all_urls:
+            f.write(f"{url}\n")
+
     for url in all_urls:
         response = requests.get("http://www.saij.gob.ar/view-document?guid="+url.split("/")[-1])
         response_json = json.loads(response.content)
         # extract the content
-
+        contenido = json.loads(response_json['data'])['document']['content']
         # Find linked content
-        #JSONcontent = {"url": url, "content": contenido, "date": find_date(contenido), "attached_file":None}
+        #JSONcontent = {"url": url, "content": contenido}
 
-        print(response_json)
+        print(contenido)
 
-    # Optionally, save the URLs to a file
-    with open('collected_urls.txt', 'w') as f:
-        for url in all_urls:
-            f.write(f"{url}\n")
+        with open('dataset.jsonl', 'a') as f:
+            f.write(f"{contenido}\n")
 
 if __name__ == "__main__":
     main()
