@@ -38,7 +38,7 @@ class AdaptiveRateLimiter:
         self.delay = min(self.delay * self.backoff_factor, self.max_delay)
 
 class RateLimiter:
-    def __init__(self, calls: int = 1, period: float = 1.0, backoff_factor: float = 2.0, jitter: float = 1):
+    def __init__(self, calls: int = 1, period: float = 1.0, backoff_factor: float = 1.4, jitter: float = 1):
         self.calls = calls
         self.period = period
         self.backoff_factor = backoff_factor
@@ -284,7 +284,7 @@ if __name__ == "__main__":
     parser.add_argument('--data', help='Only scrape content data', action='store_true')
     parser.add_argument('--amount', type=int, help='Maximum amount of URLs to scrape at a time', default=4000)
     parser.add_argument('--log-level', help='Logging level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
-    parser.add_argument('--initial-delay', type=float, default=0.1, help='Initial delay for adaptive rate limiting')
+    parser.add_argument('--initial-delay', type=float, default=0.01, help='Initial delay for adaptive rate limiting')
     parser.add_argument('--max-delay', type=float, default=5.0, help='Maximum delay for adaptive rate limiting')
     args = parser.parse_args()
 
