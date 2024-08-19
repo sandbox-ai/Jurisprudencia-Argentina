@@ -7,7 +7,6 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
-import time
 from tqdm import tqdm
 
 # Constants
@@ -79,7 +78,7 @@ class RateLimiter:
         if self.error_count >= 5:
             self.calls = max(1, self.calls - 1)
             self.error_count = 0
-                    
+
 def retry(max_retries: int = 3, delay: float = 1.0):
     def decorator(func):
         @wraps(func)
@@ -180,20 +179,15 @@ def load_existing_data(file_path: Path, key: str) -> Set[str]:
     try:
         with file_path.open('r') as f:
             if key == 'url':
-                # For URL file, each line is a URL
-                existing_data = set(line.strip() for line in f if line.strip())
+                existing_data = {line.strip() for line in f if line.strip()}
             else:
-                # For dataset file, each line is a JSON object
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                        if key in data:
-                            existing_data.add(data[key])
-                    except json.JSONDecodeError:
-                        logging.warning(f"Skipping invalid JSON in dataset: {line.strip()}")
-        tqdm.write(f"Loaded {len(existing_data)} existing entries from {file_path}", file=sys.stdout)
+                existing_data = {json.loads(line).get(key) for line in f if line.strip() and key in json.loads(line)}
     except FileNotFoundError:
         tqdm.write(f"No existing data found at {file_path}", file=sys.stdout)
+    except json.JSONDecodeError as e:
+        logging.warning(f"Skipping invalid JSON in dataset: {e}")
+    else:
+        tqdm.write(f"Loaded {len(existing_data)} existing entries from {file_path}", file=sys.stdout)
     return existing_data
 
 def validate_data(content: Dict[str, Any]) -> bool:
@@ -205,13 +199,11 @@ async def main(args):
     urls_file = Path(args.urls_output)
     dataset_file = Path(args.dataset_output)
     
-    existing_urls = load_existing_data(urls_file, 'url')
-    existing_guids = load_existing_data(dataset_file, 'guid')
-
     rate_limiter = RateLimiter(calls=1000000, period=100)
 
     async with aiohttp.ClientSession() as session:
         if not args.data:
+            existing_urls = load_existing_data(urls_file, 'url')
             all_urls = set()
             pbar = tqdm(desc="Collecting URLs")
             # Scrape the latest URLs and data
@@ -257,6 +249,7 @@ async def main(args):
                     f.write(f"{url}\n")
             tqdm.write(f"Saved {len(all_urls)} new URLs to {urls_file}", file=sys.stdout)
 
+        existing_guids = load_existing_data(dataset_file, 'guid')
         urls_to_scrape = [url.strip() for url in urls_file.open('r')]
         pbar = tqdm(total=len(urls_to_scrape), desc="Scraping data", position=1, leave=True)
         for url in urls_to_scrape:
