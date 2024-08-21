@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install bs4 requests huggingface_hub
+          pip install bs4 requests huggingface_hub aiohttp tqdm
 
       - name: Clone dataset
         run: |
