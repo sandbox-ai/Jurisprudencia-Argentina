@@ -190,6 +190,18 @@ def load_existing_data(file_path: Path, key: str) -> Set[str]:
         tqdm.write(f"Loaded {len(existing_data)} existing entries from {file_path}", file=sys.stdout)
     return existing_data
 
+def load_existing_data_reverse(file_path, key):
+    existing_guids = set()
+    with open(file_path, 'r') as f:
+        for line in reversed(list(f)):
+            data = json.loads(line)
+            existing_guids.add(data[key])
+    return existing_guids
+
+def read_lines_reverse(file_path):
+    with open(file_path, 'r') as f:
+        return list(reversed([line.strip() for line in f]))
+
 def validate_data(content: Dict[str, Any]) -> bool:
     """Validate scraped data."""
     required_fields = ['guid']  # Add more fields as needed
@@ -203,6 +215,7 @@ async def main(args):
 
     async with aiohttp.ClientSession() as session:
         if not args.data:
+            tqdm.write("Loading existing URL list...")
             existing_urls = load_existing_data(urls_file, 'url')
             all_urls = set()
             pbar = tqdm(desc="Collecting URLs")
@@ -214,15 +227,10 @@ async def main(args):
                 offset = 0
                 while True:
                     urls = await get_urls(session, BASE_URL, offset, current_year, rate_limiter)
-                    if not urls:
-                        tqdm.write(f"No more URLs found for year {current_year}", file=sys.stdout)
-                        break
                     new_urls = set(urls) - existing_urls
                     if not new_urls:
-                        tqdm.write(f"No new URLs found for year {current_year}", file=sys.stdout)
-                        current_year -= 1
-                        offset = 0
-                        continue
+                        tqdm.write(f"No more new URLs", file=sys.stdout)
+                        break
                     all_urls.update(new_urls)
                     pbar.update(len(new_urls))
                     tqdm.write(f"Collected {len(new_urls)} new URLs from year {current_year}, offset {offset}", file=sys.stdout)
@@ -249,18 +257,23 @@ async def main(args):
                     f.write(f"{url}\n")
             tqdm.write(f"Saved {len(all_urls)} new URLs to {urls_file}", file=sys.stdout)
 
-        existing_guids = load_existing_data(dataset_file, 'guid')
-        urls_to_scrape = [url.strip() for url in urls_file.open('r')]
+        # Load existing GUIDs into a set in reverse order
+        tqdm.write("Loading existing dataset...")
+        existing_guids = load_existing_data_reverse(dataset_file, 'guid')
+
+        # Load URLs to scrape into a list in reverse order
+        tqdm.write("Loading URLs to scrape...")
+        urls_to_scrape = read_lines_reverse(urls_file)
+
         pbar = tqdm(total=len(urls_to_scrape), desc="Scraping data", position=1, leave=True)
         for url in urls_to_scrape:
             guid = url.split("/")[-1]
             if guid in existing_guids:
                 tqdm.write(f"Skipping {guid} - already in dataset", file=sys.stdout)
-                pbar.update(1)
-                continue
+                break  # Stop the iteration if an existing entry is found
             content = await scrape_data(session, url, rate_limiter)
             if content and validate_data(content):
-                with dataset_file.open('a') as f:
+                with open(dataset_file, 'a') as f:
                     json.dump(content, f)
                     f.write('\n')
                 tqdm.write(f"Added {guid} to dataset", file=sys.stdout)

@@ -1,5 +1,5 @@
 # Jurisprudencia-Argentina
-Scrapper y armado de dataset a partir del [Sistema Argentino de Información Jurídica](www.saij.gob.ar)
+Scrapper y armado de dataset a partir del [Sistema Argentino de Información Jurídica](http://www.saij.gob.ar)
 -
 
 ## Uso
