@@ -259,11 +259,17 @@ async def main(args):
 
         # Load existing GUIDs into a set in reverse order
         tqdm.write("Loading existing dataset...")
-        existing_guids = load_existing_data_reverse(dataset_file, 'guid')
-
+        if args.update:
+            existing_guids = load_existing_data_reverse(dataset_file, 'guid')
+        else:
+            existing_guids = load_existing_data(dataset_file, 'guid')
         # Load URLs to scrape into a list in reverse order
         tqdm.write("Loading URLs to scrape...")
-        urls_to_scrape = read_lines_reverse(urls_file)
+        if args.update:
+            urls_to_scrape = read_lines_reverse(urls_file)
+        else:
+            with urls_file.open('r') as f:
+                urls_to_scrape = [url.strip() for url in f]
 
         pbar = tqdm(total=len(urls_to_scrape), desc="Scraping data", position=1, leave=True)
         for url in urls_to_scrape:

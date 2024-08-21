@@ -1,0 +1,42 @@
+name: Update HuggingFace Dataset
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Runs at midnight every day
+  workflow_dispatch:
+
+jobs:
+  update-dataset:
+    runs-on: ubuntu-latest
+    env:
+      HF_USER: ${{ vars.HF_USER }}
+      HF_DATASET: ${{ vars.HF_DATASET }}
+      GIT_CLONE_PROTECTION_ACTIVE: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install bs4 requests huggingface_hub
+
+      - name: Clone dataset
+        run: |
+          git clone https://huggingface.co/datasets/${HF_USER}/${HF_DATASET}
+
+      - name: Update dataset
+        run: |
+          python scrapper.py --update --dataset-output ${HF_DATASET}/dataset.jsonl --urls-output ${HF_DATASET}/urls.txt
+          
+      - name: Commit changes to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          huggingface-cli login --token ${HF_TOKEN}
+          huggingface-cli upload ${HF_USER}/${HF_DATASET} ${HF_DATASET}/dataset.jsonl --repo-type=dataset --commit-message="Daily update from Github actions"
+          huggingface-cli upload ${HF_USER}/${HF_DATASET} ${HF_DATASET}/urls.txt --repo-type=dataset --commit-message="Daily update from Github actions"
