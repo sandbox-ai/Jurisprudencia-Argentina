@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install bs4 requests huggingface_hub
+          pip install huggingface_hub
 
       - name: Clone dataset
         run: |
