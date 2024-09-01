@@ -83,3 +83,9 @@ Por ahora, el crawler recopila y guarda los datos de las entradas en el formato 
   "guid": "GUID del registro"
 }
 ```
+---
+## [Dataset en Huggingface🤗](https://huggingface.co/datasets/marianbasti/jurisprudencia-Argentina-SAIJ)
+Actualizada diariamente
+
+Estado de la última actualizacion: 
+[![Update HuggingFace Dataset](https://github.com/sandbox-ai/Jurisprudencia-Argentina/actions/workflows/update_hf_dataset.yml/badge.svg)](https://github.com/sandbox-ai/Jurisprudencia-Argentina/actions/workflows/update_hf_dataset.yml)
