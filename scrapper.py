@@ -332,7 +332,10 @@ async def main(args):
             guid = url.split("/")[-1]
             if guid in existing_guids:
                 tqdm.write(f"Skipping {guid} - already in dataset", file=sys.stdout)
-                break  # Stop the iteration if an existing entry is found
+                if args.update:
+                    break  # Stop the iteration if an existing entry is found and update flag is passed
+                else:
+                    continue  # Skip saving the guid content and continue scraping
             content = await scrape_data(session, url, rate_limiter)
             if content and validate_data(content):
                 with open(dataset_file, 'a') as f:
