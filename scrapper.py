@@ -158,6 +158,7 @@ async def scrape_data(session: aiohttp.ClientSession, url: str, rate_limiter: Ra
                 return None
             data = await response.json()
             content = json.loads(data['data'])['document']['content']
+            content = enforce_schema(content)
             content['guid'] = guid
             return content
     except aiohttp.ClientError as e:
@@ -172,6 +173,61 @@ async def scrape_data(session: aiohttp.ClientSession, url: str, rate_limiter: Ra
         logging.error(f"Unexpected error in scrape_data for {guid}: {e}")
         rate_limiter.reset_on_error()
         raise e
+
+correct_schema = {
+    "descriptores": {
+        "descriptor": [
+            {
+                "elegido": {
+                    "termino": "Término elegido para describir al caso"
+                },
+                "preferido": {
+                    "termino": "Término preferido para describir al caso"
+                },
+                "sinonimos": {
+                    "termino": ["Lista de sinónimos"]
+                }
+            }
+        ],
+        "suggest": {
+            "termino": ["Lista de términos sugeridos"]
+        }
+    }
+}
+
+def enforce_schema(data):
+    if not isinstance(data, dict):
+        return correct_schema
+
+    descriptores = data.get('descriptores', {})
+    if not isinstance(descriptores, dict):
+        tqdm.write(f"Wrong schema for descriptores: {descriptores}", file=sys.stdout)
+        return correct_schema
+
+    descriptor = descriptores.get('descriptor', [])
+    if not isinstance(descriptor, list) or not all(isinstance(d, dict) for d in descriptor):
+        return correct_schema
+
+    for d in descriptor:
+        if 'elegido' not in d or not isinstance(d['elegido'], dict):
+            tqdm.write(f"Wrong schema for elegido: {d}", file=sys.stdout)
+            return correct_schema
+        if 'preferido' not in d or not isinstance(d['preferido'], dict):
+            tqdm.write(f"Wrong schema for preferido: {d}", file=sys.stdout)
+            return correct_schema
+        if 'sinonimos' not in d or not isinstance(d['sinonimos'], dict):
+            d['sinonimos'] = {'termino':[]}
+        if not isinstance(d['sinonimos']['termino'], list):
+            d['sinonimos']['termino'] = [d['sinonimos']['termino']]
+
+    suggest = descriptores.get('suggest', {})
+    if not isinstance(suggest, dict):
+        tqdm.write(f"Wrong schema for suggest: {suggest}", file=sys.stdout)
+        return correct_schema
+    if 'termino' not in suggest or not isinstance(suggest['termino'], list):
+        suggest['termino'] = []
+
+    return data
 
 def load_existing_data(file_path: Path, key: str) -> Set[str]:
     """Load existing data from a file."""
