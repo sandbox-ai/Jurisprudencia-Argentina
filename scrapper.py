@@ -335,6 +335,7 @@ async def main(args):
                 if args.update:
                     break  # Stop the iteration if an existing entry is found and update flag is passed
                 else:
+                    pbar.update(1)
                     continue  # Skip saving the guid content and continue scraping
             content = await scrape_data(session, url, rate_limiter)
             if content and validate_data(content):
