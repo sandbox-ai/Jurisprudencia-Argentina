@@ -40,3 +40,11 @@ jobs:
           huggingface-cli login --token ${HF_TOKEN}
           huggingface-cli upload ${HF_USER}/${HF_DATASET} ${HF_DATASET}/dataset.jsonl --repo-type=dataset --commit-message="Daily update from Github actions"
           huggingface-cli upload ${HF_USER}/${HF_DATASET} ${HF_DATASET}/urls.txt --repo-type=dataset --commit-message="Daily update from Github actions"
+  keepalive-job:
+    name: Keepalive Workflow
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2
