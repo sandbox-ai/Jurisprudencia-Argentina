@@ -269,7 +269,7 @@ async def main(args):
     
     rate_limiter = RateLimiter(calls=1000000, period=100)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         if not args.data:
             tqdm.write("Loading existing URL list...")
             existing_urls = load_existing_data(urls_file, 'url')
