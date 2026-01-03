@@ -10,8 +10,18 @@ from functools import wraps
 from tqdm import tqdm
 
 # Constants
-BASE_URL = "http://www.saij.gob.ar/busqueda?o=0&p={}&f=Total|Fecha/{}[20,1]|Estado de Vigencia[5,1]|Tema[5,1]|Organismo[5,1]|Autor[5,1]|Jurisdicción|Tribunal[5,1]|Publicación[5,1]|Colección temática[5,1]|Tipo de Documento/Jurisprudencia&s=fecha-rango|DESC&v=colapsada"
-DATA_URL = "http://www.saij.gob.ar/view-document?guid={}"
+# resultados.jsp is an HTML shell; the actual JSON payload is returned by /busqueda.
+# We keep pagination via `o` (offset) and `p` (page size) and filter to Jurisprudencia.
+BUSQUEDA_URL = "https://www.saij.gob.ar/busqueda"
+DEFAULT_FACETS = (
+    "Total|Fecha[20,1]|Estado de Vigencia[5,1]|Tema[5,1]|Organismo[5,1]|Autor[5,1]|"
+    "Jurisdicción|Tribunal[5,1]|Publicación[5,1]|Colección temática[5,1]|"
+    "Tipo de Documento/Jurisprudencia"
+)
+DEFAULT_SORT = "fecha-rango|DESC"
+DEFAULT_VIEW = "colapsada"
+
+DATA_URL = "https://www.saij.gob.ar/view-document?guid={}"
 
 class AdaptiveRateLimiter:
     def __init__(self, initial_delay: float = 0.1, max_delay: float = 5.0, backoff_factor: float = 1.5):
@@ -95,26 +105,40 @@ def retry(max_retries: int = 3, delay: float = 1.0):
     return decorator
 
 @retry(max_retries=3)
-async def get_urls(session: aiohttp.ClientSession, base_url: str, offset: int, year: int, rate_limiter: RateLimiter) -> Optional[List[str]]:
+async def get_urls(session: aiohttp.ClientSession, offset: int, page_size: int, rate_limiter: RateLimiter) -> List[str]:
     await rate_limiter.wait()
-    url = base_url.replace("o=0", f"o={offset}").format(args.amount, year)
+    params = {
+        "o": offset,
+        "p": page_size,
+        "f": DEFAULT_FACETS,
+        "s": DEFAULT_SORT,
+        "v": DEFAULT_VIEW,
+    }
     try:
-        async with session.get(url) as response:
-            if response.status == 500:
-                tqdm.write(f"No more URLs for year {year}", file=sys.stdout)
-                return []
+        async with session.get(BUSQUEDA_URL, params=params) as response:
             if response.status != 200:
-                logging.error(f"Failed to fetch URLs: HTTP {response.status}")
+                body = await response.text()
+                logging.error(f"Failed to fetch URLs: HTTP {response.status} body={body[:200]!r}")
                 rate_limiter.reset_on_error()
-                return None
-            data = await response.json()
+                raise aiohttp.ClientResponseError(
+                    request_info=response.request_info,
+                    history=response.history,
+                    status=response.status,
+                    message="Failed to fetch URLs",
+                    headers=response.headers,
+                )
+
+            # SAIJ returns JSON here (application/json).
+            data = await response.json(content_type=None)
             
             if not isinstance(data, dict):
-                logging.error(f"Unexpected response type: {type(data)}")
-                return None
+                raise ValueError(f"Unexpected response type: {type(data)}")
             
             search_results = data.get("searchResults", {})
             document_list = search_results.get("documentResultList", [])
+
+            if not document_list:
+                return []
             
             urls = []
             for item in document_list:
@@ -131,15 +155,15 @@ async def get_urls(session: aiohttp.ClientSession, base_url: str, offset: int, y
     except aiohttp.ClientError as e:
         logging.error(f"Network error while fetching URLs: {e}")
         rate_limiter.reset_on_error()
-        return None
+        raise
     except json.JSONDecodeError as e:
         logging.error(f"JSON decoding error: {e}")
         rate_limiter.reset_on_error()
-        return None
+        raise
     except Exception as e:
         logging.error(f"Unexpected error in get_urls: {e}")
         rate_limiter.reset_on_error()
-        return None
+        raise
 
 @retry(max_retries=10, delay=1)
 async def scrape_data(session: aiohttp.ClientSession, url: str, rate_limiter: RateLimiter) -> Optional[dict]:
@@ -275,36 +299,32 @@ async def main(args):
             existing_urls = load_existing_data(urls_file, 'url')
             all_urls = set()
             pbar = tqdm(desc="Collecting URLs")
-            # Scrape the latest URLs and data
-            year = datetime.now().year
+
             if args.update:
-                # Scrape URLs from current year backwards until we find an existing one
-                current_year = datetime.now().year
+                # Scrape URLs from newest to oldest until we hit already-known pages.
                 offset = 0
                 while True:
-                    urls = await get_urls(session, BASE_URL, offset, current_year, rate_limiter)
+                    urls = await get_urls(session, offset, args.amount, rate_limiter)
                     new_urls = set(urls) - existing_urls
                     if not new_urls:
                         tqdm.write(f"No more new URLs", file=sys.stdout)
                         break
                     all_urls.update(new_urls)
                     pbar.update(len(new_urls))
-                    tqdm.write(f"Collected {len(new_urls)} new URLs from year {current_year}, offset {offset}", file=sys.stdout)
+                    tqdm.write(f"Collected {len(new_urls)} new URLs at offset {offset}", file=sys.stdout)
                     offset += args.amount
             else:
-                # Scrape URLs from oldest to newest
-                for year in range(1799, datetime.now().year + 1, 1):
-                    tqdm.write(f"Attempting to collect URLs for year {year}", file=sys.stdout)
-                    offset = 0
-                    while True:
-                        urls = await get_urls(session, BASE_URL, offset, year, rate_limiter)
-                        if not urls:
-                            tqdm.write(f"No more URLs in year {year}", file=sys.stdout)
-                            break
-                        new_urls = set(urls) - existing_urls
-                        all_urls.update(new_urls)
-                        offset += args.amount
-                        pbar.update(len(new_urls))
+                # Scrape URLs from newest to oldest until the endpoint returns no results.
+                offset = 0
+                while True:
+                    urls = await get_urls(session, offset, args.amount, rate_limiter)
+                    if not urls:
+                        tqdm.write("No more URLs.", file=sys.stdout)
+                        break
+                    new_urls = set(urls) - existing_urls
+                    all_urls.update(new_urls)
+                    offset += args.amount
+                    pbar.update(len(new_urls))
 
             pbar.close()
 
