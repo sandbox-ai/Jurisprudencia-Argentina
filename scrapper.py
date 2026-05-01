@@ -1,7 +1,9 @@
 import asyncio
-import aiohttp
-import json, sys,random
+import json, sys, random
 import logging
+import subprocess
+import signal
+import os
 from typing import List, Set, Optional, Dict, Any
 import argparse
 from pathlib import Path
@@ -23,28 +25,132 @@ DEFAULT_VIEW = "colapsada"
 
 DATA_URL = "https://www.saij.gob.ar/view-document?guid={}"
 
-class AdaptiveRateLimiter:
-    def __init__(self, initial_delay: float = 0.1, max_delay: float = 5.0, backoff_factor: float = 1.5):
-        self.delay = initial_delay
-        self.max_delay = max_delay
-        self.backoff_factor = backoff_factor
-        self.success_streak = 0
-        self.failure_streak = 0
+# Obscura CDP config
+OBSCURA_PORT = 9222
 
-    async def wait(self):
-        await asyncio.sleep(self.delay)
 
-    def success(self):
-        self.success_streak += 1
-        self.failure_streak = 0
-        if self.success_streak >= 10:
-            self.delay = max(self.delay / self.backoff_factor, 0.1)
-            self.success_streak = 0
+class ObscuraClient:
+    """Async client for obscura headless browser via CDP websocket."""
 
-    def failure(self):
-        self.failure_streak += 1
-        self.success_streak = 0
-        self.delay = min(self.delay * self.backoff_factor, self.max_delay)
+    def __init__(self, port: int = OBSCURA_PORT):
+        self.port = port
+        self.binary = os.environ.get("OBSCURA_BINARY", "./obscura")
+        self.ws = None
+        self.session_id = None
+        self.process = None
+        self._req_id = 0
+
+    async def _next_id(self):
+        self._req_id += 1
+        return self._req_id
+
+    async def _send_recv(self, method: str, params: dict = None, timeout: float = 30) -> dict:
+        """Send a CDP command and wait for the response."""
+        req_id = await self._next_id()
+        msg = {'id': req_id, 'method': method, 'params': params or {}}
+        if self.session_id:
+            msg['sessionId'] = self.session_id
+        await self.ws.send(json.dumps(msg))
+
+        while True:
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=timeout)
+            resp = json.loads(raw)
+            if 'id' in resp and resp['id'] == req_id:
+                return resp
+
+    async def start(self):
+        """Start obscura serve process and connect via websocket."""
+        import websockets
+
+        # Kill any existing obscura on this port
+        try:
+            result = subprocess.run(
+                ['lsof', '-ti', f':{self.port}'],
+                capture_output=True, text=True, timeout=5
+            )
+            for pid in result.stdout.strip().split('\n'):
+                if pid.isdigit():
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        # Start obscura serve
+        tqdm.write(f"Starting obscura on port {self.port}...", file=sys.stdout)
+        self.process = subprocess.Popen(
+            [self.binary, 'serve', '--port', str(self.port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+        # Wait for obscura to be ready
+        for attempt in range(30):
+            await asyncio.sleep(1)
+            try:
+                self.ws = await asyncio.wait_for(
+                    websockets.connect(f'ws://127.0.0.1:{self.port}/devtools/browser'),
+                    timeout=5
+                )
+                tqdm.write("Obscura connected!", file=sys.stdout)
+                break
+            except Exception:
+                if attempt == 29:
+                    tqdm.write("Failed to connect to obscura!", file=sys.stdout)
+                    raise
+        else:
+            raise RuntimeError("Failed to connect to obscura")
+
+        # Create target
+        await self.ws.send(json.dumps({
+            'id': 0, 'method': 'Target.createTarget',
+            'params': {'url': 'about:blank'}
+        }))
+        for _ in range(5):
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
+            msg = json.loads(raw)
+            if msg.get('method') == 'Target.attachedToTarget':
+                self.session_id = msg['params']['sessionId']
+                break
+
+        # Enable Network and set browser-like headers
+        await self._send_recv('Network.enable')
+        await self._send_recv('Network.setExtraHTTPHeaders', {
+            'headers': {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'es-AR,es;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+            }
+        })
+
+    async def navigate_and_get_body(self, url: str, timeout: float = 30) -> str:
+        """Navigate to a URL and return the page body text."""
+        await self._send_recv('Page.navigate', {'url': url}, timeout=timeout)
+        resp = await self._send_recv('Runtime.evaluate', {
+            'expression': 'document.body.innerText'
+        }, timeout=timeout)
+        return resp.get('result', {}).get('result', {}).get('value', '')
+
+    async def close(self):
+        """Close the websocket and stop the obscura process."""
+        try:
+            if self.ws:
+                await self.ws.close()
+        except Exception:
+            pass
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
 
 class RateLimiter:
     def __init__(self, calls: int = 1, period: float = 1.0, backoff_factor: float = 1.4, jitter: float = 1):
@@ -55,11 +161,10 @@ class RateLimiter:
         self.timestamps = []
         self.successful_requests = 0
         self.error_count = 0
-        self.adaptive_limiter = AdaptiveRateLimiter()
 
     async def wait(self):
         now = datetime.now()
-        backoff = 1  # Initial backoff multiplier
+        backoff = 1
         while True:
             if len(self.timestamps) < self.calls:
                 self.timestamps.append(now)
@@ -67,27 +172,24 @@ class RateLimiter:
                 if self.successful_requests >= 11:
                     self.calls += 1
                     self.successful_requests = 0
-                await self.adaptive_limiter.wait()
-                self.adaptive_limiter.success()
                 break
             elif now - self.timestamps[0] > timedelta(seconds=self.period):
                 self.timestamps.pop(0)
                 self.successful_requests += 1
             else:
                 jitter_delay = self.period * (self.backoff_factor ** backoff) + random.uniform(-self.jitter, self.jitter)
-                await asyncio.sleep(jitter_delay)
+                await asyncio.sleep(max(0, jitter_delay))
                 backoff *= self.backoff_factor
-                self.adaptive_limiter.failure()
 
     def reset_on_error(self):
         self.calls = max(1, self.calls - 1)
         self.backoff_factor *= 2
         self.successful_requests = 0
         self.error_count += 1
-        self.adaptive_limiter.failure()
         if self.error_count >= 5:
             self.calls = max(1, self.calls - 1)
             self.error_count = 0
+
 
 def retry(max_retries: int = 3, delay: float = 1.0):
     def decorator(func):
@@ -96,16 +198,17 @@ def retry(max_retries: int = 3, delay: float = 1.0):
             for attempt in range(max_retries):
                 try:
                     return await func(*args, **kwargs)
-                except (aiohttp.ClientError, json.JSONDecodeError, Exception) as e:
+                except Exception as e:
                     if attempt == max_retries - 1:
                         raise
                     logging.warning(f"Attempt {attempt + 1} failed: {e}. Retrying...")
-                    await asyncio.sleep(delay * (2 ** attempt))  # Exponential backoff
+                    await asyncio.sleep(delay * (2 ** attempt))
         return wrapper
     return decorator
 
+
 @retry(max_retries=3)
-async def get_urls(session: aiohttp.ClientSession, offset: int, page_size: int, rate_limiter: RateLimiter) -> List[str]:
+async def get_urls(client: ObscuraClient, offset: int, page_size: int, rate_limiter: RateLimiter) -> List[str]:
     await rate_limiter.wait()
     params = {
         "o": offset,
@@ -114,89 +217,75 @@ async def get_urls(session: aiohttp.ClientSession, offset: int, page_size: int, 
         "s": DEFAULT_SORT,
         "v": DEFAULT_VIEW,
     }
+    # Build URL with query params
+    from urllib.parse import urlencode
+    url = f"{BUSQUEDA_URL}?{urlencode(params, doseq=True)}"
+
     try:
-        async with session.get(BUSQUEDA_URL, params=params) as response:
-            if response.status != 200:
-                body = await response.text()
-                logging.error(f"Failed to fetch URLs: HTTP {response.status} body={body[:200]!r}")
-                rate_limiter.reset_on_error()
-                raise aiohttp.ClientResponseError(
-                    request_info=response.request_info,
-                    history=response.history,
-                    status=response.status,
-                    message="Failed to fetch URLs",
-                    headers=response.headers,
-                )
+        body = await client.navigate_and_get_body(url, timeout=30)
 
-            # SAIJ returns JSON here (application/json).
-            data = await response.json(content_type=None)
-            
-            if not isinstance(data, dict):
-                raise ValueError(f"Unexpected response type: {type(data)}")
-            
-            search_results = data.get("searchResults", {})
-            document_list = search_results.get("documentResultList", [])
+        # Parse JSON response
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON decode error: {body[:200]!r}")
+            rate_limiter.reset_on_error()
+            raise
 
-            if not document_list:
-                return []
-            
-            urls = []
-            for item in document_list:
-                try:
-                    result = json.loads(item["documentAbstract"])
-                    friendly_url = result["document"]["metadata"]["friendly-url"]["description"]
-                    uuid = result["document"]["metadata"]["uuid"]
-                    urls.append(f"{friendly_url}/{uuid}")
-                except (json.JSONDecodeError, KeyError) as e:
-                    logging.warning(f"Error parsing item: {e}")
-                    continue
-            
-            return urls
-    except aiohttp.ClientError as e:
-        logging.error(f"Network error while fetching URLs: {e}")
-        rate_limiter.reset_on_error()
-        raise
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON decoding error: {e}")
-        rate_limiter.reset_on_error()
-        raise
+        if not isinstance(data, dict):
+            raise ValueError(f"Unexpected response type: {type(data)}")
+
+        if not data.get('success', True) and 'errors' in data:
+            logging.error(f"SAIJ API error: {data['errors']}")
+            rate_limiter.reset_on_error()
+            raise ValueError(f"SAIJ API error: {data['errors']}")
+
+        search_results = data.get("searchResults", {})
+        document_list = search_results.get("documentResultList", [])
+
+        if not document_list:
+            return []
+
+        urls = []
+        for item in document_list:
+            try:
+                result = json.loads(item["documentAbstract"])
+                friendly_url = result["document"]["metadata"]["friendly-url"]["description"]
+                uuid = result["document"]["metadata"]["uuid"]
+                urls.append(f"{friendly_url}/{uuid}")
+            except (json.JSONDecodeError, KeyError) as e:
+                logging.warning(f"Error parsing item: {e}")
+                continue
+
+        return urls
+
     except Exception as e:
-        logging.error(f"Unexpected error in get_urls: {e}")
+        logging.error(f"Error in get_urls: {e}")
         rate_limiter.reset_on_error()
         raise
+
 
 @retry(max_retries=10, delay=1)
-async def scrape_data(session: aiohttp.ClientSession, url: str, rate_limiter: RateLimiter) -> Optional[dict]:
+async def scrape_data(client: ObscuraClient, url: str, rate_limiter: RateLimiter) -> Optional[dict]:
     await rate_limiter.wait()
     guid = url.split("/")[-1]
     data_url = DATA_URL.format(guid)
+
     try:
-        async with session.get(data_url) as response:
-            if response.status == 403:
-                tqdm.write(f"403 Forbidden error for {guid}, retrying...", file=sys.stdout)
-                rate_limiter.reset_on_error()
-                raise aiohttp.ClientError("403 Forbidden")
-            if response.status != 200:
-                logging.error(f"Failed to fetch data for {guid}: HTTP {response.status}")
-                rate_limiter.reset_on_error()
-                return None
-            data = await response.json()
-            content = json.loads(data['data'])['document']['content']
-            content = enforce_schema(content)
-            content['guid'] = guid
-            return content
-    except aiohttp.ClientError as e:
-        logging.error(f"Network error while scraping data for {guid}: {e}")
-        rate_limiter.reset_on_error()
-        raise e
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON decoding error for {guid}: {e}")
-        rate_limiter.reset_on_error()
-        raise e
+        body = await client.navigate_and_get_body(data_url, timeout=30)
+
+        # Parse JSON response
+        data = json.loads(body)
+        content = json.loads(data['data'])['document']['content']
+        content = enforce_schema(content)
+        content['guid'] = guid
+        return content
+
     except Exception as e:
-        logging.error(f"Unexpected error in scrape_data for {guid}: {e}")
+        logging.error(f"Error in scrape_data for {guid}: {e}")
         rate_limiter.reset_on_error()
         raise e
+
 
 correct_schema = {
     "descriptores": {
@@ -219,6 +308,7 @@ correct_schema = {
     }
 }
 
+
 def enforce_schema(data):
     if not isinstance(data, dict):
         return correct_schema
@@ -240,7 +330,7 @@ def enforce_schema(data):
             tqdm.write(f"Wrong schema for preferido: {d}", file=sys.stdout)
             return correct_schema
         if 'sinonimos' not in d or not isinstance(d['sinonimos'], dict):
-            d['sinonimos'] = {'termino':[]}
+            d['sinonimos'] = {'termino': []}
         if not isinstance(d['sinonimos']['termino'], list):
             d['sinonimos']['termino'] = [d['sinonimos']['termino']]
 
@@ -252,6 +342,7 @@ def enforce_schema(data):
         suggest['termino'] = []
 
     return data
+
 
 def load_existing_data(file_path: Path, key: str) -> Set[str]:
     """Load existing data from a file."""
@@ -270,6 +361,7 @@ def load_existing_data(file_path: Path, key: str) -> Set[str]:
         tqdm.write(f"Loaded {len(existing_data)} existing entries from {file_path}", file=sys.stdout)
     return existing_data
 
+
 def load_existing_data_reverse(file_path, key):
     existing_guids = set()
     with open(file_path, 'r') as f:
@@ -278,46 +370,33 @@ def load_existing_data_reverse(file_path, key):
             existing_guids.add(data[key])
     return existing_guids
 
+
 def read_lines_reverse(file_path):
     with open(file_path, 'r') as f:
         return list(reversed([line.strip() for line in f]))
 
+
 def validate_data(content: Dict[str, Any]) -> bool:
     """Validate scraped data."""
-    required_fields = ['guid']  # Add more fields as needed
+    required_fields = ['guid']
     return all(field in content for field in required_fields)
+
 
 async def main(args):
     urls_file = Path(args.urls_output)
     dataset_file = Path(args.dataset_output)
-    
+
     rate_limiter = RateLimiter(calls=1000000, period=100)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.saij.gob.ar/",
-        "Origin": "https://www.saij.gob.ar",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        # Warmup: visit the main page to get session cookies.
-        # Many Apache/mod_security setups require a valid session before allowing API access.
-        try:
-            async with session.get("https://www.saij.gob.ar/") as warmup_resp:
-                tqdm.write(f"Session warmup status: {warmup_resp.status}", file=sys.stdout)
-                await warmup_resp.read()
-        except Exception as e:
-            tqdm.write(f"Session warmup failed (continuing anyway): {e}", file=sys.stdout)
+    # Start obscura headless browser
+    client = ObscuraClient(port=args.obscura_port)
+    try:
+        await client.start()
+    except Exception as e:
+        tqdm.write(f"Failed to start obscura: {e}", file=sys.stdout)
+        sys.exit(1)
 
+    try:
         if not args.data:
             tqdm.write("Loading existing URL list...")
             existing_urls = load_existing_data(urls_file, 'url')
@@ -325,10 +404,9 @@ async def main(args):
             pbar = tqdm(desc="Collecting URLs")
 
             if args.update:
-                # Scrape URLs from newest to oldest until we hit already-known pages.
                 offset = 0
                 while True:
-                    urls = await get_urls(session, offset, args.amount, rate_limiter)
+                    urls = await get_urls(client, offset, args.amount, rate_limiter)
                     new_urls = set(urls) - existing_urls
                     if not new_urls:
                         tqdm.write(f"No more new URLs", file=sys.stdout)
@@ -338,10 +416,9 @@ async def main(args):
                     tqdm.write(f"Collected {len(new_urls)} new URLs at offset {offset}", file=sys.stdout)
                     offset += args.amount
             else:
-                # Scrape URLs from newest to oldest until the endpoint returns no results.
                 offset = 0
                 while True:
-                    urls = await get_urls(session, offset, args.amount, rate_limiter)
+                    urls = await get_urls(client, offset, args.amount, rate_limiter)
                     if not urls:
                         tqdm.write("No more URLs.", file=sys.stdout)
                         break
@@ -357,13 +434,14 @@ async def main(args):
                     f.write(f"{url}\n")
             tqdm.write(f"Saved {len(all_urls)} new URLs to {urls_file}", file=sys.stdout)
 
-        # Load existing GUIDs into a set in reverse order
+        # Load existing GUIDs
         tqdm.write("Loading existing dataset...")
         if args.update:
             existing_guids = load_existing_data_reverse(dataset_file, 'guid')
         else:
             existing_guids = load_existing_data(dataset_file, 'guid')
-        # Load URLs to scrape into a list in reverse order
+
+        # Load URLs to scrape
         tqdm.write("Loading URLs to scrape...")
         if args.update:
             urls_to_scrape = read_lines_reverse(urls_file)
@@ -377,11 +455,12 @@ async def main(args):
             if guid in existing_guids:
                 tqdm.write(f"Skipping {guid} - already in dataset", file=sys.stdout)
                 if args.update:
-                    break  # Stop the iteration if an existing entry is found and update flag is passed
+                    break
                 else:
                     pbar.update(1)
-                    continue  # Skip saving the guid content and continue scraping
-            content = await scrape_data(session, url, rate_limiter)
+                    continue
+
+            content = await scrape_data(client, url, rate_limiter)
             if content and validate_data(content):
                 with open(dataset_file, 'a') as f:
                     json.dump(content, f)
@@ -392,6 +471,10 @@ async def main(args):
             pbar.update(1)
         pbar.close()
 
+    finally:
+        await client.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Scraping dataset from URLs')
     parser.add_argument('--urls-output', help='Output file for URLs', default='urls.txt')
@@ -399,12 +482,15 @@ if __name__ == "__main__":
     parser.add_argument('--update', help='Only scrape the latest content', action='store_true')
     parser.add_argument('--data', help='Only scrape content data', action='store_true')
     parser.add_argument('--amount', type=int, help='Maximum amount of URLs to scrape at a time', default=4000)
-    parser.add_argument('--log-level', help='Logging level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
-    parser.add_argument('--initial-delay', type=float, default=0.01, help='Initial delay for adaptive rate limiting')
-    parser.add_argument('--max-delay', type=float, default=5.0, help='Maximum delay for adaptive rate limiting')
+    parser.add_argument('--log-level', help='Logging level', default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+    parser.add_argument('--obscura-port', type=int, default=OBSCURA_PORT, help='Port for obscura CDP')
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level), 
-                        format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
 
     asyncio.run(main(args))
