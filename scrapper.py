@@ -293,7 +293,31 @@ async def main(args):
     
     rate_limiter = RateLimiter(calls=1000000, period=100)
 
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.saij.gob.ar/",
+        "Origin": "https://www.saij.gob.ar",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+        # Warmup: visit the main page to get session cookies.
+        # Many Apache/mod_security setups require a valid session before allowing API access.
+        try:
+            async with session.get("https://www.saij.gob.ar/") as warmup_resp:
+                tqdm.write(f"Session warmup status: {warmup_resp.status}", file=sys.stdout)
+                await warmup_resp.read()
+        except Exception as e:
+            tqdm.write(f"Session warmup failed (continuing anyway): {e}", file=sys.stdout)
+
         if not args.data:
             tqdm.write("Loading existing URL list...")
             existing_urls = load_existing_data(urls_file, 'url')
