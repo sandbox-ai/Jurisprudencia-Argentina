@@ -28,7 +28,6 @@ jobs:
       - name: Download obscura headless browser
         run: |
           curl -sSL https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz | tar xz
-          mv obscura ./obscura
           chmod +x ./obscura
           ls -la ./obscura
 
