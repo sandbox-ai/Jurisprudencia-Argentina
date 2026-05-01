@@ -102,10 +102,10 @@ class ObscuraClient:
         else:
             raise RuntimeError("Failed to connect to obscura")
 
-        # Create target
+        # Create target on saij.gob.ar to avoid CORS issues with fetch()
         await self.ws.send(json.dumps({
             'id': 0, 'method': 'Target.createTarget',
-            'params': {'url': 'about:blank'}
+            'params': {'url': 'https://www.saij.gob.ar/'}
         }))
         for _ in range(5):
             raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
@@ -118,6 +118,7 @@ class ObscuraClient:
         await self._send_recv('Network.enable')
         await self._send_recv('Network.setExtraHTTPHeaders', {
             'headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'es-AR,es;q=0.9,en;q=0.8',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -129,6 +130,11 @@ class ObscuraClient:
             }
         })
 
+        # Visit main page first to establish cookies/session
+        tqdm.write("Initializing session with saij.gob.ar...", file=sys.stdout)
+        await self._send_recv('Page.navigate', {'url': 'https://www.saij.gob.ar/'})
+        await asyncio.sleep(2)
+
     async def navigate_and_get_body(self, url: str, timeout: float = 30) -> str:
         """Navigate to a URL and return the page body text."""
         await self._send_recv('Page.navigate', {'url': url}, timeout=timeout)
@@ -136,6 +142,27 @@ class ObscuraClient:
             'expression': 'document.body.innerText'
         }, timeout=timeout)
         return resp.get('result', {}).get('result', {}).get('value', '')
+
+    async def fetch_json(self, url: str, timeout: float = 30) -> str:
+        """Fetch a URL using browser's fetch API and return the response text.
+        This bypasses Content-Type rendering issues and works for JSON endpoints."""
+        # Escape backslashes and quotes for safe JS string interpolation
+        safe_url = url.replace('\\', '\\\\').replace('"', '\\"')
+        resp = await self._send_recv('Runtime.evaluate', {
+            'expression': f'''
+                (async () => {{
+                    const response = await fetch("{safe_url}");
+                    if (!response.ok) throw new Error(`HTTP {{response.status}}: {{response.statusText}}`);
+                    return await response.text();
+                }})()
+            '''.strip(),
+            'awaitPromise': True,
+        }, timeout=timeout)
+
+        result = resp.get('result', {})
+        if result.get('subtype') == 'error':
+            raise RuntimeError(result.get('value', 'Unknown fetch error'))
+        return result.get('value', '')
 
     async def close(self):
         """Close the websocket and stop the obscura process."""
@@ -222,7 +249,7 @@ async def get_urls(client: ObscuraClient, offset: int, page_size: int, rate_limi
     url = f"{BUSQUEDA_URL}?{urlencode(params, doseq=True)}"
 
     try:
-        body = await client.navigate_and_get_body(url, timeout=30)
+        body = await client.fetch_json(url, timeout=30)
 
         # Parse JSON response
         try:
@@ -272,7 +299,7 @@ async def scrape_data(client: ObscuraClient, url: str, rate_limiter: RateLimiter
     data_url = DATA_URL.format(guid)
 
     try:
-        body = await client.navigate_and_get_body(data_url, timeout=30)
+        body = await client.fetch_json(data_url, timeout=30)
 
         # Parse JSON response
         data = json.loads(body)
