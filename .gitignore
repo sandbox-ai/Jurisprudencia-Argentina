@@ -3,3 +3,5 @@ __pycache__/
 *.json
 *.txt
 datasetbkp/
+obscura*
+update_dataset.py

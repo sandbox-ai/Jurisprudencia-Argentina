@@ -16,11 +16,9 @@ from tqdm import tqdm
 # We keep pagination via `o` (offset) and `p` (page size) and filter to Jurisprudencia.
 BUSQUEDA_URL = "https://www.saij.gob.ar/busqueda"
 DEFAULT_FACETS = (
-    "Total|Fecha[20,1]|Estado de Vigencia[5,1]|Tema[5,1]|Organismo[5,1]|Autor[5,1]|"
-    "Jurisdicción|Tribunal[5,1]|Publicación[5,1]|Colección temática[5,1]|"
-    "Tipo de Documento/Jurisprudencia"
+    "Total|Tipo de Documento/Jurisprudencia|Fecha|Organismo|Publicación|"
+    "Tema|Estado de Vigencia|Autor|Jurisdicción"
 )
-DEFAULT_SORT = "fecha-rango|DESC"
 DEFAULT_VIEW = "colapsada"
 
 DATA_URL = "https://www.saij.gob.ar/view-document?guid={}"
@@ -118,11 +116,26 @@ class ObscuraClient:
                 break
 
         await self._send_recv('Network.enable')
+        await self._send_recv('Page.enable')
 
         # Visit main page first to establish cookies/session (JSESSIONID is required)
         tqdm.write("Initializing session with saij.gob.ar...", file=sys.stdout)
-        await self._send_recv('Page.navigate', {'url': 'https://www.saij.gob.ar/'})
-        await asyncio.sleep(3)
+        # Send navigate and wait for load event properly
+        req_id = await self._next_id()
+        await self.ws.send(json.dumps({
+            'id': req_id, 'method': 'Page.navigate',
+            'params': {'url': 'https://www.saij.gob.ar/'},
+            'sessionId': self.session_id
+        }))
+        end = asyncio.get_event_loop().time() + 15
+        while asyncio.get_event_loop().time() < end:
+            try:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
+                msg = json.loads(raw)
+                if msg.get('method') == 'Page.loadEventFired':
+                    break
+            except asyncio.TimeoutError:
+                pass
 
     async def navigate_and_get_body(self, url: str, timeout: float = 30) -> str:
         """Navigate to a URL and return the page body text."""
@@ -136,8 +149,34 @@ class ObscuraClient:
         """Navigate to a URL and return the response body as text.
         Works for both HTML pages and JSON endpoints (SAIJ returns JSON in <body>).
         Uses Page.navigate + document.body.innerText which works reliably with obscura."""
-        await self._send_recv('Page.navigate', {'url': url}, timeout=timeout)
-        await asyncio.sleep(1.5)
+        # Send the navigate command and wait for BOTH the cmd response AND load event
+        req_id = await self._next_id()
+        msg = {'id': req_id, 'method': 'Page.navigate', 'params': {'url': url}, 'sessionId': self.session_id}
+        await self.ws.send(json.dumps(msg))
+
+        loaded = False
+        replied = False
+        end = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < end:
+            remaining = max(0.5, end - asyncio.get_event_loop().time())
+            try:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=remaining)
+                resp = json.loads(raw)
+                if 'id' in resp and resp['id'] == req_id:
+                    replied = True
+                    if resp.get('result', {}).get('errorText'):
+                        raise RuntimeError(f"Navigation failed: {resp['result']['errorText']}")
+                if resp.get('method') == 'Page.loadEventFired':
+                    loaded = True
+                if replied and loaded:
+                    break
+            except asyncio.TimeoutError:
+                pass
+
+        if not replied:
+            raise RuntimeError(f"Navigation timed out for {url}")
+
+        await asyncio.sleep(1)  # brief settle for any post-load JS
         resp = await self._send_recv('Runtime.evaluate', {
             'expression': 'document.body.innerText',
             'returnByValue': True,
@@ -221,62 +260,60 @@ def retry(max_retries: int = 3, delay: float = 1.0):
 
 
 @retry(max_retries=3)
-async def get_urls(client: ObscuraClient, offset: int, page_size: int, rate_limiter: RateLimiter) -> List[str]:
+async def get_urls_for_month(client: ObscuraClient, year: int, month: int,
+                            rate_limiter: RateLimiter,
+                            page_size: int = 200) -> List[str]:
+    """Fetch all jurisprudencia URLs for a specific year/month using month-filtered facets."""
     await rate_limiter.wait()
-    params = {
-        "o": offset,
-        "p": page_size,
-        "f": DEFAULT_FACETS,
-        "s": DEFAULT_SORT,
-        "v": DEFAULT_VIEW,
-    }
-    # Build URL with query params
+    ym = f"{year}/{month:02d}"
+    facets = f"Total|Tipo de Documento/Jurisprudencia|Fecha/{ym}|Organismo|Publicación|Tema|Estado de Vigencia|Autor|Jurisdicción"
     from urllib.parse import urlencode
-    url = f"{BUSQUEDA_URL}?{urlencode(params, doseq=True)}"
 
-    try:
-        body = await client.navigate_fetch(url, timeout=30)
+    all_urls = []
+    offset = 0
+    while True:
+        params = {"o": offset, "p": page_size, "f": facets, "v": DEFAULT_VIEW}
+        url = f"{BUSQUEDA_URL}?{urlencode(params, doseq=True)}"
 
-        # Parse JSON response
+        try:
+            body = await client.navigate_fetch(url, timeout=45)
+        except Exception as e:
+            if offset == 0:
+                raise
+            # Subsequent pages failing means we hit the end
+            break
+
         try:
             data = json.loads(body)
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON decode error: {body[:200]!r}")
-            rate_limiter.reset_on_error()
-            raise
+        except json.JSONDecodeError:
+            logging.error(f"JSON decode error for {ym} offset={offset}")
+            break
 
         if not isinstance(data, dict):
-            raise ValueError(f"Unexpected response type: {type(data)}")
-
-        if not data.get('success', True) and 'errors' in data:
-            # Server error (e.g. pagination limit reached) — not transient
-            logging.warning(f"SAIJ API error: {data['errors']}")
-            return []
+            break
 
         search_results = data.get("searchResults", {})
         document_list = search_results.get("documentResultList", [])
 
         if not document_list:
-            return []
+            break
 
-        urls = []
         for item in document_list:
             try:
                 result = json.loads(item["documentAbstract"])
                 friendly_url = result["document"]["metadata"]["friendly-url"]["description"]
                 uuid = result["document"]["metadata"]["uuid"]
-                urls.append(f"{friendly_url}/{uuid}")
-            except (json.JSONDecodeError, KeyError) as e:
-                logging.warning(f"Error parsing item: {e}")
+                all_urls.append(f"{friendly_url}/{uuid}")
+            except (json.JSONDecodeError, KeyError):
                 continue
 
-        return urls
+        # If we got fewer than requested, we've hit the last page
+        if len(document_list) < page_size:
+            break
 
-    except Exception as e:
-        logging.error(f"Error in get_urls: {e}")
-        rate_limiter.reset_on_error()
-        raise
+        offset += page_size
 
+    return all_urls
 
 @retry(max_retries=10, delay=1)
 async def scrape_data(client: ObscuraClient, url: str, rate_limiter: RateLimiter) -> Optional[dict]:
@@ -413,34 +450,50 @@ async def main(args):
         if not args.data:
             tqdm.write("Loading existing URL list...")
             existing_urls = load_existing_data(urls_file, 'url')
-            all_urls = set()
-            pbar = tqdm(desc="Collecting URLs")
+            all_new_urls = set()
 
             if args.update:
-                # Only scrape the first batch of pages (most recent) for new additions.
-                # SAIJ caps pagination at ~1000 docs, so one page is enough.
-                urls = await get_urls(client, 0, args.amount, rate_limiter)
-                new_urls = set(urls) - existing_urls
-                all_urls.update(new_urls)
-                tqdm.write(f"Collected {len(new_urls)} new URLs from first page", file=sys.stdout)
-            else:
-                offset = 0
-                while True:
-                    urls = await get_urls(client, offset, args.amount, rate_limiter)
-                    if not urls:
-                        tqdm.write("No more URLs.", file=sys.stdout)
-                        break
+                # Scrape the last N months for new entries.
+                # Month-filtered facets are the only reliable way SAIJ returns
+                # results sorted by recency.
+                now = datetime.now()
+                current_year, current_month = now.year, now.month
+                for i in range(args.months):
+                    # Walk backwards by months
+                    m = current_month - i
+                    y = current_year
+                    while m <= 0:
+                        m += 12
+                        y -= 1
+                    ym = f"{y}/{m:02d}"
+                    tqdm.write(f"Checking {ym}...", file=sys.stdout)
+                    urls = await get_urls_for_month(client, y, m, rate_limiter, page_size=args.amount)
                     new_urls = set(urls) - existing_urls
-                    all_urls.update(new_urls)
-                    offset += args.amount
-                    pbar.update(len(new_urls))
-
-            pbar.close()
+                    all_new_urls.update(new_urls)
+                    tqdm.write(f"  {ym}: {len(urls)} total, {len(new_urls)} new", file=sys.stdout)
+            else:
+                # Full scrape: iterate all months from now back to 1970
+                for year in range(datetime.now().year, 1969, -1):
+                    for month in range(12, 0, -1):
+                        y, m = (year, month)
+                        # Skip future months
+                        now = datetime.now()
+                        if y > now.year or (y == now.year and m > now.month):
+                            continue
+                        urls = await get_urls_for_month(client, y, m, rate_limiter, page_size=args.amount)
+                        if not urls:
+                            # If a recent month returns nothing, keep going
+                            # (could just be an empty month)
+                            tqdm.write(f"{y}/{m:02d}: 0 entries", file=sys.stdout)
+                            continue
+                        new_urls = set(urls) - existing_urls
+                        all_new_urls.update(new_urls)
+                        tqdm.write(f"{y}/{m:02d}: {len(urls)} total, {len(new_urls)} new", file=sys.stdout)
 
             with urls_file.open('a') as f:
-                for url in all_urls:
+                for url in all_new_urls:
                     f.write(f"{url}\n")
-            tqdm.write(f"Saved {len(all_urls)} new URLs to {urls_file}", file=sys.stdout)
+            tqdm.write(f"Saved {len(all_new_urls)} new URLs to {urls_file}", file=sys.stdout)
 
         # Load existing GUIDs
         tqdm.write("Loading existing dataset...")
@@ -489,7 +542,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset-output', help='Output file for dataset', default='dataset.jsonl')
     parser.add_argument('--update', help='Only scrape the latest content', action='store_true')
     parser.add_argument('--data', help='Only scrape content data', action='store_true')
-    parser.add_argument('--amount', type=int, help='Maximum amount of URLs to scrape at a time', default=1000)
+    parser.add_argument('--amount', type=int, help='Maximum amount of URLs to scrape at a time', default=200)
+    parser.add_argument('--months', type=int, help='Number of past months to check for updates (--update mode)', default=3)
     parser.add_argument('--log-level', help='Logging level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
     parser.add_argument('--obscura-port', type=int, default=OBSCURA_PORT, help='Port for obscura CDP')
