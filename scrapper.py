@@ -90,7 +90,10 @@ class ObscuraClient:
             await asyncio.sleep(1)
             try:
                 self.ws = await asyncio.wait_for(
-                    websockets.connect(f'ws://127.0.0.1:{self.port}/devtools/browser'),
+                    websockets.connect(
+                        f'ws://127.0.0.1:{self.port}/devtools/browser',
+                        max_size=10 * 1024 * 1024  # 10MB for large JSON responses
+                    ),
                     timeout=5
                 )
                 tqdm.write("Obscura connected!", file=sys.stdout)
@@ -102,10 +105,10 @@ class ObscuraClient:
         else:
             raise RuntimeError("Failed to connect to obscura")
 
-        # Create target on saij.gob.ar to avoid CORS issues with fetch()
+        # Create a blank target (custom headers interfere with cookie-setting)
         await self.ws.send(json.dumps({
             'id': 0, 'method': 'Target.createTarget',
-            'params': {'url': 'https://www.saij.gob.ar/'}
+            'params': {'url': 'about:blank'}
         }))
         for _ in range(5):
             raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
@@ -114,26 +117,12 @@ class ObscuraClient:
                 self.session_id = msg['params']['sessionId']
                 break
 
-        # Enable Network and set browser-like headers
         await self._send_recv('Network.enable')
-        await self._send_recv('Network.setExtraHTTPHeaders', {
-            'headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'es-AR,es;q=0.9,en;q=0.8',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
-            }
-        })
 
-        # Visit main page first to establish cookies/session
+        # Visit main page first to establish cookies/session (JSESSIONID is required)
         tqdm.write("Initializing session with saij.gob.ar...", file=sys.stdout)
         await self._send_recv('Page.navigate', {'url': 'https://www.saij.gob.ar/'})
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
     async def navigate_and_get_body(self, url: str, timeout: float = 30) -> str:
         """Navigate to a URL and return the page body text."""
@@ -143,26 +132,23 @@ class ObscuraClient:
         }, timeout=timeout)
         return resp.get('result', {}).get('result', {}).get('value', '')
 
-    async def fetch_json(self, url: str, timeout: float = 30) -> str:
-        """Fetch a URL using browser's fetch API and return the response text.
-        This bypasses Content-Type rendering issues and works for JSON endpoints."""
-        # Escape backslashes and quotes for safe JS string interpolation
-        safe_url = url.replace('\\', '\\\\').replace('"', '\\"')
+    async def navigate_fetch(self, url: str, timeout: float = 30) -> str:
+        """Navigate to a URL and return the response body as text.
+        Works for both HTML pages and JSON endpoints (SAIJ returns JSON in <body>).
+        Uses Page.navigate + document.body.innerText which works reliably with obscura."""
+        await self._send_recv('Page.navigate', {'url': url}, timeout=timeout)
+        await asyncio.sleep(1.5)
         resp = await self._send_recv('Runtime.evaluate', {
-            'expression': f'''
-                (async () => {{
-                    const response = await fetch("{safe_url}");
-                    if (!response.ok) throw new Error(`HTTP {{response.status}}: {{response.statusText}}`);
-                    return await response.text();
-                }})()
-            '''.strip(),
-            'awaitPromise': True,
+            'expression': 'document.body.innerText',
+            'returnByValue': True,
         }, timeout=timeout)
-
         result = resp.get('result', {})
         if result.get('subtype') == 'error':
-            raise RuntimeError(result.get('value', 'Unknown fetch error'))
-        return result.get('value', '')
+            raise RuntimeError(result.get('description', 'Unknown evaluate error'))
+        value = result.get('result', {}).get('value', '')
+        if not value:
+            raise RuntimeError(f"Empty response body from {url}")
+        return value
 
     async def close(self):
         """Close the websocket and stop the obscura process."""
@@ -249,7 +235,7 @@ async def get_urls(client: ObscuraClient, offset: int, page_size: int, rate_limi
     url = f"{BUSQUEDA_URL}?{urlencode(params, doseq=True)}"
 
     try:
-        body = await client.fetch_json(url, timeout=30)
+        body = await client.navigate_fetch(url, timeout=30)
 
         # Parse JSON response
         try:
@@ -263,9 +249,9 @@ async def get_urls(client: ObscuraClient, offset: int, page_size: int, rate_limi
             raise ValueError(f"Unexpected response type: {type(data)}")
 
         if not data.get('success', True) and 'errors' in data:
-            logging.error(f"SAIJ API error: {data['errors']}")
-            rate_limiter.reset_on_error()
-            raise ValueError(f"SAIJ API error: {data['errors']}")
+            # Server error (e.g. pagination limit reached) — not transient
+            logging.warning(f"SAIJ API error: {data['errors']}")
+            return []
 
         search_results = data.get("searchResults", {})
         document_list = search_results.get("documentResultList", [])
@@ -299,7 +285,7 @@ async def scrape_data(client: ObscuraClient, url: str, rate_limiter: RateLimiter
     data_url = DATA_URL.format(guid)
 
     try:
-        body = await client.fetch_json(data_url, timeout=30)
+        body = await client.navigate_fetch(data_url, timeout=30)
 
         # Parse JSON response
         data = json.loads(body)
@@ -431,17 +417,12 @@ async def main(args):
             pbar = tqdm(desc="Collecting URLs")
 
             if args.update:
-                offset = 0
-                while True:
-                    urls = await get_urls(client, offset, args.amount, rate_limiter)
-                    new_urls = set(urls) - existing_urls
-                    if not new_urls:
-                        tqdm.write(f"No more new URLs", file=sys.stdout)
-                        break
-                    all_urls.update(new_urls)
-                    pbar.update(len(new_urls))
-                    tqdm.write(f"Collected {len(new_urls)} new URLs at offset {offset}", file=sys.stdout)
-                    offset += args.amount
+                # Only scrape the first batch of pages (most recent) for new additions.
+                # SAIJ caps pagination at ~1000 docs, so one page is enough.
+                urls = await get_urls(client, 0, args.amount, rate_limiter)
+                new_urls = set(urls) - existing_urls
+                all_urls.update(new_urls)
+                tqdm.write(f"Collected {len(new_urls)} new URLs from first page", file=sys.stdout)
             else:
                 offset = 0
                 while True:
@@ -508,7 +489,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset-output', help='Output file for dataset', default='dataset.jsonl')
     parser.add_argument('--update', help='Only scrape the latest content', action='store_true')
     parser.add_argument('--data', help='Only scrape content data', action='store_true')
-    parser.add_argument('--amount', type=int, help='Maximum amount of URLs to scrape at a time', default=4000)
+    parser.add_argument('--amount', type=int, help='Maximum amount of URLs to scrape at a time', default=1000)
     parser.add_argument('--log-level', help='Logging level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
     parser.add_argument('--obscura-port', type=int, default=OBSCURA_PORT, help='Port for obscura CDP')
