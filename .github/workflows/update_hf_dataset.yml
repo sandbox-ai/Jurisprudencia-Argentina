@@ -1,4 +1,5 @@
 name: Update HuggingFace Dataset
+runs-on: self-hosted
 
 on:
   schedule:
