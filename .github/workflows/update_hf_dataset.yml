@@ -24,6 +24,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          uv venv
+          source .venv/bin/activate
           uv pip install websockets huggingface_hub tqdm aiohttp
 
       - name: Download obscura headless browser
@@ -40,7 +42,7 @@ jobs:
         env:
           OBSCURA_BINARY: ${{ github.workspace }}/obscura
         run: |
-          python scrapper.py --update --dataset-output ${HF_DATASET}/dataset.jsonl --urls-output ${HF_DATASET}/urls.txt
+          uv run scrapper.py --update --dataset-output ${HF_DATASET}/dataset.jsonl --urls-output ${HF_DATASET}/urls.txt
           
       - name: Commit changes to Hugging Face Hub
         env:
