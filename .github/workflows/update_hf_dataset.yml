@@ -1,5 +1,4 @@
 name: Update HuggingFace Dataset
-runs-on: self-hosted
 
 on:
   schedule:
@@ -8,7 +7,7 @@ on:
 
 jobs:
   update-dataset:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     env:
       HF_USER: ${{ vars.HF_USER }}
       HF_DATASET: ${{ vars.HF_DATASET }}
@@ -51,7 +50,7 @@ jobs:
           hf upload ${HF_USER}/${HF_DATASET} ${HF_DATASET}/urls.txt --repo-type=dataset --commit-message="Daily update from Github actions"
   keepalive-job:
     name: Keepalive Workflow
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       actions: write
     steps:
